@@ -8,7 +8,6 @@ import { fileURLToPath } from "url";
 import bodyParser from "body-parser";
 import crypto from "crypto";
 import axios from "axios";
-import qs from "qs";
 
 dotenv.config();
 
@@ -18,6 +17,8 @@ const app = express();
 
 const {
   PORT = 3000,
+
+  // Nuvemshop / Tiendanube
   NS_CLIENT_ID,
   NS_CLIENT_SECRET,
   NS_REDIRECT_URL,
@@ -25,85 +26,105 @@ const {
   NS_API_VERSION = "2025-03",
   NS_USER_AGENT = "GoAffPro Bridge (contact@example.com)",
   NS_SCRIPT_ID,
+
+  // GoAffPro
   GOAFFPRO_ACCESS_TOKEN,
   GOAFFPRO_API_BASE = "https://api.goaffpro.com",
-  GOAFFPRO_WEBHOOK_SECRET = "change-me"
+  GOAFFPRO_WEBHOOK_SECRET = "change-me",
 } = process.env;
 
 if (!NS_CLIENT_ID || !NS_CLIENT_SECRET || !NS_REDIRECT_URL) {
-  console.warn("[warn] Please set NS_CLIENT_ID, NS_CLIENT_SECRET, NS_REDIRECT_URL in .env");
+  console.warn("[warn] Please set NS_CLIENT_ID, NS_CLIENT_SECRET, NS_REDIRECT_URL in env.");
 }
 
 app.use(cors());
 app.use(morgan("dev"));
 app.use("/public", express.static(path.join(__dirname, "..", "public")));
 
-/* ------------------------------------------------------------------ */
-/* Webhook Nuvemshop (raw body p/ validar assinatura)                  */
-/* ------------------------------------------------------------------ */
-app.post("/webhooks/nuvemshop", express.raw({ type: "application/json" }), async (req, res) => {
-  try {
-    const signature = req.header("x-linkedstore-hmac-sha256") || "";
-    const calculated = crypto.createHmac("sha256", NS_CLIENT_SECRET).update(req.body).digest("hex");
-    const ok =
-      signature.length === calculated.length &&
-      crypto.timingSafeEqual(Buffer.from(signature, "utf8"), Buffer.from(calculated, "utf8"));
-    if (!ok) return res.status(401).send("invalid signature");
-  } catch (e) {
-    return res.status(401).send("signature check failed");
-  }
+// ---------------------------------------------------------------------------
+// NUVEMSHOP WEBHOOK (usa raw body para validar a assinatura)
+// ---------------------------------------------------------------------------
+app.post(
+  "/webhooks/nuvemshop",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    // valida assinatura
+    try {
+      const signature = req.header("x-linkedstore-hmac-sha256") || "";
+      const calculated = crypto
+        .createHmac("sha256", NS_CLIENT_SECRET)
+        .update(req.body)
+        .digest("hex");
 
-  let payload;
-  try {
-    payload = JSON.parse(req.body.toString("utf8"));
-  } catch {
-    return res.status(400).send("invalid json");
-  }
+      const ok =
+        signature.length === calculated.length &&
+        crypto.timingSafeEqual(
+          Buffer.from(signature, "utf8"),
+          Buffer.from(calculated, "utf8")
+        );
 
-  const { store_id, event, id } = payload || {};
-  console.log("[webhook][nuvemshop]", event, "store:", store_id, "id:", id);
+      if (!ok) return res.status(401).send("invalid signature");
+    } catch (e) {
+      return res.status(401).send("signature check failed");
+    }
 
-  if (event && event.startsWith("order/")) {
-    if (event === "order/paid" || event === "order/created" || event === "order/updated") {
-      try {
-        const order = await nsGetOrder(store_id, id);
-        const couponCode = order?.coupon ?? null;
-        const email = order?.customer ? (order.customer.email || null) : null;
-        const total = order?.total ?? null;
-        const currency = order?.currency ?? null;
+    // parse payload
+    let payload;
+    try {
+      payload = JSON.parse(req.body.toString("utf8"));
+    } catch {
+      return res.status(400).send("invalid json");
+    }
 
-        await maybeAttachUtmCustomFields(store_id, order, email);
+    const { store_id, event, id } = payload || {};
+    console.log("[webhook][nuvemshop]", event, "store:", store_id, "id:", id);
 
-        await goaffproSendOrder({
-          order_id: order ? order.id : id,
-          coupon: couponCode,
-          email,
-          total,
-          currency,
-          store_id
-        });
-      } catch (err) {
-        console.error("error processing order webhook", err?.response?.data || err.message);
+    if (event && event.startsWith("order/")) {
+      if (event === "order/paid" || event === "order/created" || event === "order/updated") {
+        try {
+          const order = await nsGetOrder(store_id, id);
+
+          const couponCode = order?.coupon ?? null;
+          const email = order?.customer ? order.customer.email ?? null : null;
+          const total = order?.total ?? null;
+          const currency = order?.currency ?? null;
+
+          await maybeAttachUtmCustomFields(store_id, order, email);
+
+          await goaffproSendOrder({
+            order_id: order ? order.id : id,
+            coupon: couponCode,
+            email,
+            total,
+            currency,
+            store_id,
+          });
+        } catch (err) {
+          console.error(
+            "[webhook][nuvemshop] process error",
+            err?.response?.data || err.message
+          );
+        }
       }
     }
+
+    res.status(200).json({ ok: true });
   }
+);
 
-  res.status(200).json({ ok: true });
-});
-
-/* ------------------------------------------------------------------ */
-/* JSON body para os demais endpoints                                  */
-/* ------------------------------------------------------------------ */
+// ---------------------------------------------------------------------------
+// JSON body para demais rotas
+// ---------------------------------------------------------------------------
 app.use(bodyParser.json());
 
-/* ------------------------------------------------------------------ */
-/* Health                                                              */
-/* ------------------------------------------------------------------ */
+// ---------------------------------------------------------------------------
+// HEALTH
+// ---------------------------------------------------------------------------
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
-/* ------------------------------------------------------------------ */
-/* OAuth callback                                                      */
-/* ------------------------------------------------------------------ */
+// ---------------------------------------------------------------------------
+// OAUTH CALLBACK (instalação do app)
+// ---------------------------------------------------------------------------
 app.get("/auth/callback", async (req, res) => {
   const code = req.query.code;
   if (!code) return res.status(400).send("missing code");
@@ -111,13 +132,19 @@ app.get("/auth/callback", async (req, res) => {
   try {
     const tokenRes = await axios.post(
       "https://www.tiendanube.com/apps/authorize/token",
-      { client_id: NS_CLIENT_ID, client_secret: NS_CLIENT_SECRET, grant_type: "authorization_code", code },
+      {
+        client_id: NS_CLIENT_ID,
+        client_secret: NS_CLIENT_SECRET,
+        grant_type: "authorization_code",
+        code,
+      },
       { headers: { "Content-Type": "application/json" } }
     );
+
     const { access_token, user_id, scope } = tokenRes.data;
     console.log("[oauth] store", user_id, "scopes:", scope);
 
-    // persistência em memória (simples) — se reiniciar, precisa reinstalar
+    // simples: guarda em memória (se reiniciar o serviço, reinstalar o app)
     Tokens.set(String(user_id), access_token);
 
     await ensureNuvemshopInstallSetup(user_id);
@@ -129,41 +156,64 @@ app.get("/auth/callback", async (req, res) => {
   }
 });
 
-/* ------------------------------------------------------------------ */
-/* Webhook GoAffPro → criar cupom na Nuvemshop                         */
-/* ------------------------------------------------------------------ */
+// ---------------------------------------------------------------------------
+// GOAFFPRO WEBHOOK → cria cupom na Nuvemshop
+// Configure na GoAffPro (Settings → Integrations → Webhooks):
+//   Topic: Affiliate signup  → URL: https://SEU_DOMINIO/webhooks/goaffpro?secret=SEU_SEGREDO
+//   Topic: Affiliate update  → (mesma URL)
+// ---------------------------------------------------------------------------
 app.post("/webhooks/goaffpro", async (req, res) => {
   const secret = req.query.secret;
   if (secret !== GOAFFPRO_WEBHOOK_SECRET) return res.status(401).send("unauthorized");
 
-  // o evento pode vir no header ou no body
+  // evento pode estar no header ou no body
   const headerEvent = req.header("x-goaffpro-event");
   const bodyEvent = (req.body && (req.body.event || req.body.type)) || null;
   const event = headerEvent || bodyEvent || "unknown";
+
+  // o payload varia; tentamos cobrir os formatos mais comuns
+  const affiliate =
+    req.body?.affiliate || req.body?.data || req.body?.payload || null;
+
   console.log("[webhook][goaffpro] event:", event);
-  console.log("[webhook][goaffpro] body:", JSON.stringify(req.body || {}, null, 2));
+  if (affiliate) {
+    console.log("[webhook][goaffpro] affiliate sample:", {
+      id: affiliate.id,
+      name: affiliate.name,
+      code: affiliate.code,
+      email: affiliate.email,
+    });
+  } else {
+    console.log("[webhook][goaffpro] raw body:", JSON.stringify(req.body || {}));
+  }
 
-  const affiliate = req.body?.affiliate || req.body?.data || null;
+  // disparar na criação OU atualização (aprovado etc.)
+  const isAffiliateEvt = /affiliate/i.test(event);
+  const isCreateOrUpdate = /(created|create|signup|updated|update|approved)/i.test(event);
 
-  if ((/affiliate/i).test(event) && (/created|create|signup/i).test(event) && affiliate) {
+  if (isAffiliateEvt && isCreateOrUpdate && affiliate) {
     try {
-      const code = suggestCouponCode(affiliate); // gera baseando em name/code/id
-      const firstStore = Tokens.firstKey();
-      const token = firstStore ? Tokens.get(firstStore) : null;
-      if (!firstStore || !token) throw new Error("no store/token available");
+      const couponCode = suggestCouponCode(affiliate);
 
-      await nsCreateCoupon(firstStore, {
-        code,
+      // pega a primeira loja conectada (como combinamos)
+      const storeId = Tokens.firstKey();
+      const token = storeId ? Tokens.get(storeId) : null;
+      if (!storeId || !token) throw new Error("no store/token available");
+
+      // cria o cupom na Nuvemshop
+      await nsCreateCoupon(storeId, {
+        code: couponCode,
         type: "percentage",
-        value: "10.00",                // ajuste aqui se quiser outro valor
-        max_uses: 0,                   // ilimitado
-        combines_with_other_discounts: false
+        value: "10.00", // ajuste o valor padrão aqui se quiser
+        max_uses: 0, // ilimitado
+        combines_with_other_discounts: false,
       });
-      console.log("[coupon] created", code);
+      console.log("[coupon] created", couponCode);
 
-      await goaffproAssignCoupon(affiliate.id, code);
+      // opcional: associa o cupom ao afiliado na GoAffPro
+      await goaffproAssignCoupon(affiliate.id, couponCode);
 
-      return res.json({ ok: true, coupon: code });
+      return res.json({ ok: true, coupon: couponCode });
     } catch (err) {
       console.error("[goaffpro webhook] coupon error", err?.response?.data || err.message);
       return res.status(500).json({ ok: false, error: err.message });
@@ -173,32 +223,22 @@ app.post("/webhooks/goaffpro", async (req, res) => {
   return res.json({ ok: true });
 });
 
-/* ------------------------------------------------------------------ */
-/* ENDPOINTS DE DIAGNÓSTICO / TESTE                                    */
-/* ------------------------------------------------------------------ */
-
-// POST e GET para o mesmo teste (navegador ou curl)
+// ---------------------------------------------------------------------------
+// DIAGNÓSTICO / TESTES
+// ---------------------------------------------------------------------------
 async function runAdminTest() {
   const anyStore = Tokens.firstKey();
   if (anyStore) await nsGetStore(anyStore);
+
   if (GOAFFPRO_ACCESS_TOKEN) {
     await axios
       .get(`${GOAFFPRO_API_BASE}/admin/ping`, {
-        headers: { "X-Goaffpro-Access-Token": GOAFFPRO_ACCESS_TOKEN }
+        headers: { "X-Goaffpro-Access-Token": GOAFFPRO_ACCESS_TOKEN },
       })
       .catch(() => {});
   }
   return { ok: true };
 }
-
-app.post("/admin/test", async (_req, res) => {
-  try {
-    const r = await runAdminTest();
-    res.json(r);
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
 
 app.get("/admin/test", async (_req, res) => {
   try {
@@ -209,7 +249,16 @@ app.get("/admin/test", async (_req, res) => {
   }
 });
 
-// cria cupom manualmente (força teste sem depender do webhook)
+app.post("/admin/test", async (_req, res) => {
+  try {
+    const r = await runAdminTest();
+    res.json(r);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// força criação de cupom manual (para teste rápido via curl)
 app.post("/admin/create-coupon", async (req, res) => {
   try {
     const { code = "TESTE10", percent = 10 } = req.body || {};
@@ -222,8 +271,9 @@ app.post("/admin/create-coupon", async (req, res) => {
       type: "percentage",
       value: Number(percent).toFixed(2),
       max_uses: 0,
-      combines_with_other_discounts: false
+      combines_with_other_discounts: false,
     });
+
     return res.json({ ok: true, code });
   } catch (e) {
     console.error("[admin/create-coupon] error", e?.response?.data || e.message);
@@ -231,7 +281,7 @@ app.post("/admin/create-coupon", async (req, res) => {
   }
 });
 
-// lista rápida de produtos para checar o token
+// lista pequena de produtos (confirma token/escopos)
 app.get("/products", async (_req, res) => {
   try {
     const storeId = Tokens.firstKey();
@@ -239,7 +289,7 @@ app.get("/products", async (_req, res) => {
     if (!storeId || !token) throw new Error("no store/token available");
 
     const out = await axios.get(`${apiBase(storeId)}/products?per_page=5`, {
-      headers: { Authentication: `bearer ${token}`, "User-Agent": NS_USER_AGENT }
+      headers: { Authentication: `bearer ${token}`, "User-Agent": NS_USER_AGENT },
     });
     res.json({ ok: true, count: out.data?.length || 0, sample: out.data || [] });
   } catch (e) {
@@ -247,16 +297,15 @@ app.get("/products", async (_req, res) => {
   }
 });
 
-/* ------------------------------------------------------------------ */
-/* Helpers & API clients                                               */
-/* ------------------------------------------------------------------ */
-
+// ---------------------------------------------------------------------------
+// HELPERS
+// ---------------------------------------------------------------------------
 const Tokens = {
   _map: new Map(),
   set: (storeId, token) => Tokens._map.set(String(storeId), token),
   get: (storeId) => Tokens._map.get(String(storeId)),
   all: () => Tokens._map.entries(),
-  firstKey: () => Tokens._map.keys().next().value
+  firstKey: () => Tokens._map.keys().next().value,
 };
 
 function apiBase(storeId) {
@@ -266,7 +315,7 @@ function apiBase(storeId) {
 async function nsGetStore(storeId) {
   const token = Tokens.get(storeId);
   const res = await axios.get(`${apiBase(storeId)}/store`, {
-    headers: { Authentication: `bearer ${token}`, "User-Agent": NS_USER_AGENT }
+    headers: { Authentication: `bearer ${token}`, "User-Agent": NS_USER_AGENT },
   });
   return res.data;
 }
@@ -274,7 +323,7 @@ async function nsGetStore(storeId) {
 async function nsGetOrder(storeId, orderId) {
   const token = Tokens.get(storeId);
   const res = await axios.get(`${apiBase(storeId)}/orders/${orderId}`, {
-    headers: { Authentication: `bearer ${token}`, "User-Agent": NS_USER_AGENT }
+    headers: { Authentication: `bearer ${token}`, "User-Agent": NS_USER_AGENT },
   });
   return res.data;
 }
@@ -285,8 +334,8 @@ async function nsCreateCoupon(storeId, payload) {
     headers: {
       Authentication: `bearer ${token}`,
       "User-Agent": NS_USER_AGENT,
-      "Content-Type": "application/json"
-    }
+      "Content-Type": "application/json",
+    },
   });
   return res.data;
 }
@@ -294,7 +343,7 @@ async function nsCreateCoupon(storeId, payload) {
 async function nsEnsureCustomFields(storeId) {
   const token = Tokens.get(storeId);
   const res = await axios.get(`${apiBase(storeId)}/orders/custom-fields`, {
-    headers: { Authentication: `bearer ${token}`, "User-Agent": NS_USER_AGENT }
+    headers: { Authentication: `bearer ${token}`, "User-Agent": NS_USER_AGENT },
   });
   const existing = res.data || [];
   const need = [
@@ -304,7 +353,7 @@ async function nsEnsureCustomFields(storeId) {
     { key: "UTM Content", value_type: "text" },
     { key: "UTM Term", value_type: "text" },
     { key: "Affiliate Coupon", value_type: "text" },
-    { key: "Affiliate ID", value_type: "text" }
+    { key: "Affiliate ID", value_type: "text" },
   ];
   const idMap = {};
   for (const n of need) {
@@ -319,8 +368,8 @@ async function nsEnsureCustomFields(storeId) {
           headers: {
             Authentication: `bearer ${token}`,
             "User-Agent": NS_USER_AGENT,
-            "Content-Type": "application/json"
-          }
+            "Content-Type": "application/json",
+          },
         }
       );
       idMap[n.key] = created.data.id;
@@ -335,13 +384,14 @@ async function nsSetOrderCustomFieldValues(storeId, orderId, idValueList) {
     headers: {
       Authentication: `bearer ${token}`,
       "User-Agent": NS_USER_AGENT,
-      "Content-Type": "application/json"
-    }
+      "Content-Type": "application/json",
+    },
   });
 }
 
 async function ensureNuvemshopInstallSetup(storeId) {
   const token = Tokens.get(storeId);
+
   const registerWebhook = async (event, url) => {
     try {
       await axios.post(
@@ -351,15 +401,17 @@ async function ensureNuvemshopInstallSetup(storeId) {
           headers: {
             Authentication: `bearer ${token}`,
             "User-Agent": NS_USER_AGENT,
-            "Content-Type": "application/json"
-          }
+            "Content-Type": "application/json",
+          },
         }
       );
       console.log("[webhook] registered", event);
     } catch (e) {
+      // 422 = já existe — tudo bem
       console.log("[webhook] register", event, "->", e?.response?.status || e.message);
     }
   };
+
   await registerWebhook("order/paid", publicUrl("/webhooks/nuvemshop"));
   await registerWebhook("app/uninstalled", publicUrl("/webhooks/nuvemshop"));
 
@@ -374,8 +426,8 @@ async function ensureNuvemshopInstallSetup(storeId) {
           headers: {
             Authentication: `bearer ${token}`,
             "User-Agent": NS_USER_AGENT,
-            "Content-Type": "application/json"
-          }
+            "Content-Type": "application/json",
+          },
         }
       );
       console.log("[script] associated", NS_SCRIPT_ID);
@@ -416,8 +468,8 @@ async function goaffproAssignCoupon(affiliateId, code) {
       {
         headers: {
           "X-Goaffpro-Access-Token": GOAFFPRO_ACCESS_TOKEN,
-          "Content-Type": "application/json"
-        }
+          "Content-Type": "application/json",
+        },
       }
     );
     console.log("[goaffpro] coupon assigned", affiliateId, code);
@@ -436,8 +488,8 @@ async function goaffproSendOrder({ order_id, coupon, email, total, currency, sto
     await axios.post(`${GOAFFPRO_API_BASE}/admin/orders`, payload, {
       headers: {
         "X-Goaffpro-Access-Token": GOAFFPRO_ACCESS_TOKEN,
-        "Content-Type": "application/json"
-      }
+        "Content-Type": "application/json",
+      },
     });
     console.log("[goaffpro] order queued", order_id);
   } catch (e) {
@@ -445,24 +497,9 @@ async function goaffproSendOrder({ order_id, coupon, email, total, currency, sto
   }
 }
 
-async function maybeAttachUtmCustomFields(storeId, order, email) {
-  if (!email) return;
-  const utm = UTM_MEMORY.get(email.toLowerCase());
-  if (!utm) return;
-  const ids = await nsEnsureCustomFields(storeId);
-  const list = [];
-  if (utm.utm_source) list.push({ id: ids["UTM Source"], value: utm.utm_source });
-  if (utm.utm_medium) list.push({ id: ids["UTM Medium"], value: utm.utm_medium });
-  if (utm.utm_campaign) list.push({ id: ids["UTM Campaign"], value: utm.utm_campaign });
-  if (utm.utm_content) list.push({ id: ids["UTM Content"], value: utm.utm_content });
-  if (utm.utm_term) list.push({ id: ids["UTM Term"], value: utm.utm_term });
-  if (order?.coupon) list.push({ id: ids["Affiliate Coupon"], value: order.coupon });
-  await nsSetOrderCustomFieldValues(storeId, order.id, list);
-}
-
-/* ------------------------------------------------------------------ */
-/* UTM capture (opcional)                                             */
-/* ------------------------------------------------------------------ */
+// ---------------------------------------------------------------------------
+// UTM capture (opcional)
+// ---------------------------------------------------------------------------
 const UTM_MEMORY = new Map(); // email -> { utm_source,..., ts }
 app.post("/session/utm", (req, res) => {
   const { email, ...utms } = req.body || {};
@@ -471,9 +508,9 @@ app.post("/session/utm", (req, res) => {
   res.json({ ok: true });
 });
 
-/* ------------------------------------------------------------------ */
-/* Start                                                               */
-/* ------------------------------------------------------------------ */
+// ---------------------------------------------------------------------------
+// START
+// ---------------------------------------------------------------------------
 app.listen(Number(PORT), () => {
   console.log(`> server on :${PORT}`);
   console.log("Health:", `http://localhost:${PORT}/health`);
